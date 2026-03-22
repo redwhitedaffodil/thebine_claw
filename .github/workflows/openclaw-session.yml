@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   openclaw-session:
-    runs-on: ubuntu-latest
+    
     timeout-minutes: 360
 
     steps:
