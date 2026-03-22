@@ -1,0 +1,766 @@
+name: OpenClaw Session
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: 'Session identifier (auto-generated for chains)'
+        required: false
+        default: ''
+      chain_count:
+        description: 'Chain iteration counter'
+        required: false
+        default: '0'
+      openclaw_cache_version:
+        description: 'Bump to force openclaw upgrade (e.g. v1 -> v2)'
+        required: false
+        default: 'v1'
+  repository_dispatch:
+    types: [chain-openclaw]
+
+env:
+  CHAIN_TRIGGER_MINUTES: 345
+  SAVE_INTERVAL_MINUTES: 60
+  OPENCLAW_PORT: 18789
+
+concurrency:
+  group: openclaw-session
+  cancel-in-progress: false
+
+jobs:
+  openclaw-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate session info
+        id: session
+        run: |
+          SESSION_ID="${{ github.event.inputs.session_id }}"
+          if [ -z "$SESSION_ID" ]; then
+            SESSION_ID=$(uuidgen | cut -c1-8)
+          fi
+
+          CHAIN_COUNT="${{ github.event.inputs.chain_count }}"
+          if [ -z "$CHAIN_COUNT" ]; then
+            CHAIN_COUNT=0
+          fi
+
+          OPENCLAW_CACHE_VERSION="${{ github.event.inputs.openclaw_cache_version }}"
+
+          # Handle repository_dispatch payload
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            PAYLOAD_COUNT="${{ github.event.client_payload.chain_count }}"
+            if [ -n "$PAYLOAD_COUNT" ]; then
+              CHAIN_COUNT="$PAYLOAD_COUNT"
+            fi
+            PAYLOAD_CACHE="${{ github.event.client_payload.openclaw_cache_version }}"
+            if [ -n "$PAYLOAD_CACHE" ]; then
+              OPENCLAW_CACHE_VERSION="$PAYLOAD_CACHE"
+            fi
+          fi
+
+          if [ -z "$OPENCLAW_CACHE_VERSION" ]; then
+            OPENCLAW_CACHE_VERSION="v1"
+          fi
+
+          JOB_START=$(date +%s)
+
+          echo "SESSION_ID=$SESSION_ID" >> "$GITHUB_OUTPUT"
+          echo "CHAIN_COUNT=$CHAIN_COUNT" >> "$GITHUB_OUTPUT"
+          echo "OPENCLAW_CACHE_VERSION=$OPENCLAW_CACHE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "JOB_START=$JOB_START" >> "$GITHUB_OUTPUT"
+
+          echo "Session: $SESSION_ID | Chain: $CHAIN_COUNT | Cache: $OPENCLAW_CACHE_VERSION"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # ========== CACHING ==========
+      - name: Restore npm global packages cache
+        id: cache-npm-global
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.npm-global
+          key: npm-global-openclaw-${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}-${{ runner.os }}
+
+      - name: Restore Playwright browsers cache
+        id: cache-playwright
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.playwright-browsers
+          key: playwright-browsers-v1-${{ runner.os }}
+
+      # ========== OPENCLAW SETUP ==========
+      - name: Install OpenClaw
+        run: |
+          export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+
+          # Check if cache restored a working openclaw
+          CACHE_WORKING=false
+          if [ "${{ steps.cache-npm-global.outputs.cache-hit }}" = "true" ]; then
+            if command -v openclaw &>/dev/null; then
+              VER=$(openclaw --version 2>&1) && CACHE_WORKING=true
+              echo "OpenClaw restored from cache: $VER"
+            else
+              echo "WARNING: Cache hit but openclaw binary not found"
+            fi
+          else
+            echo "No npm cache hit (version: ${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }})"
+          fi
+
+          if [ "$CACHE_WORKING" = "false" ]; then
+            echo "Installing openclaw@latest fresh..."
+            npm install -g openclaw@latest
+          fi
+
+      - name: Install Playwright and Chromium for browser control
+        run: |
+          export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export PLAYWRIGHT_BROWSERS_PATH="$HOME/.playwright-browsers"
+
+          # Install Playwright npm package if not already cached
+          if [ ! -f "$HOME/.npm-global/lib/node_modules/playwright/cli.js" ]; then
+            echo "Installing Playwright npm package..."
+            npm install -g playwright
+          else
+            echo "Playwright npm package already present (cached)"
+          fi
+
+          # Install Chromium browser binary if not cached
+          if [ "${{ steps.cache-playwright.outputs.cache-hit }}" = "true" ]; then
+            # Validate cached browser exists
+            if ls "$PLAYWRIGHT_BROWSERS_PATH"/chromium-* 1>/dev/null 2>&1; then
+              echo "Playwright Chromium restored from cache"
+              # Still install system deps (not cached - they're OS packages)
+              npx playwright install-deps chromium 2>/dev/null || true
+            else
+              echo "WARNING: Cache hit but no chromium directory found, reinstalling..."
+              npx playwright install --with-deps chromium
+            fi
+          else
+            echo "Installing Playwright Chromium browser..."
+            npx playwright install --with-deps chromium
+          fi
+
+          echo "Playwright + Chromium ready at: $PLAYWRIGHT_BROWSERS_PATH"
+
+      # ========== CONFIGURE ==========
+      - name: Configure OpenClaw
+        env:
+          OPENCLAW_CONFIG: ${{ secrets.OPENCLAW_CONFIG }}
+          OPENCLAW_AUTH_PROFILES: ${{ secrets.OPENCLAW_AUTH_PROFILES }}
+        run: |
+          OPENCLAW_DIR="$HOME/.openclaw"
+          mkdir -p "$OPENCLAW_DIR"
+          mkdir -p "$OPENCLAW_DIR/workspace"
+          mkdir -p "$OPENCLAW_DIR/agents/main/agent"
+
+          # Inject openclaw.json from secret
+          if [ -n "$OPENCLAW_CONFIG" ]; then
+            # Fix paths: replace any Windows user paths with Linux home, then convert remaining backslashes to forward slashes in paths
+            CONFIG=$(echo "$OPENCLAW_CONFIG" | sed "s|C:\\\\\\\\Users\\\\\\\\[^\\\\\"]*|$HOME|g" | sed "s|C:/Users/[^/\"]*|$HOME|g")
+            # Convert Windows backslash paths to forward slashes (e.g. \\.openclaw\\workspace -> /.openclaw/workspace)
+            CONFIG=$(echo "$CONFIG" | sed 's|\\\\|/|g')
+            echo "$CONFIG" > "$OPENCLAW_DIR/openclaw.json"
+            echo "Injected openclaw.json from secret (paths fixed to $HOME)"
+          else
+            echo "ERROR: No OPENCLAW_CONFIG secret found"
+            exit 1
+          fi
+
+          # Inject auth-profiles.json from secret
+          if [ -n "$OPENCLAW_AUTH_PROFILES" ]; then
+            echo "$OPENCLAW_AUTH_PROFILES" > "$OPENCLAW_DIR/agents/main/agent/auth-profiles.json"
+            echo "Injected auth-profiles.json from secret"
+          else
+            echo "WARNING: No OPENCLAW_AUTH_PROFILES secret found"
+          fi
+
+          echo "OpenClaw configured"
+
+      - name: Find previous workspace artifact
+        id: find-artifact
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          CURRENT_RUN_ID="${{ github.run_id }}"
+
+          # Brief wait for previous session's artifact upload
+          MAX_WAIT=15
+          WAITED=0
+          while [ "$WAITED" -lt "$MAX_WAIT" ]; do
+            OTHER_RUNS=$(gh run list --repo "$REPO" --workflow "openclaw-session.yml" --status in_progress --json databaseId -q "[.[] | select(.databaseId != $CURRENT_RUN_ID)] | length")
+            if [ "$OTHER_RUNS" -gt 0 ]; then
+              echo "Previous session still running, waiting..."
+              sleep 30
+              WAITED=$((WAITED + 1))
+            else
+              break
+            fi
+          done
+
+          # Find the latest artifact
+          ARTIFACT_INFO=$(gh api "repos/$REPO/actions/artifacts" --jq '[.artifacts[] | select(.name == "openclaw-workspace" and .expired == false)] | first | "\(.id) \(.workflow_run.id)"' 2>/dev/null || echo "")
+
+          if [ -n "$ARTIFACT_INFO" ] && [ "$ARTIFACT_INFO" != "null null" ]; then
+            RUN_ID=$(echo "$ARTIFACT_INFO" | awk '{print $2}')
+            echo "Found workspace artifact from run: $RUN_ID"
+            echo "RUN_ID=$RUN_ID" >> "$GITHUB_OUTPUT"
+            echo "FOUND=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No previous workspace artifact found"
+            echo "FOUND=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore workspace from artifact
+        if: steps.find-artifact.outputs.FOUND == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: openclaw-workspace
+          path: ~/.openclaw/workspace
+          github-token: ${{ secrets.GH_PAT }}
+          run-id: ${{ steps.find-artifact.outputs.RUN_ID }}
+        continue-on-error: true
+
+      - name: Fix OpenClaw directory permissions
+        run: |
+          chmod -R u+rwX "$HOME/.openclaw"
+          echo "Permissions fixed for ~/.openclaw"
+
+      # ========== PATCH OPENCLAW ==========
+      - name: Patch OpenClaw (Antigravity models + endpoints)
+        run: |
+          export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+
+          if [ -f "./patch.sh" ]; then
+            echo "Running OpenClaw patch script..."
+            chmod +x ./patch.sh
+            bash ./patch.sh
+          else
+            echo "WARNING: patch.sh not found in repo root — skipping patching"
+          fi
+
+      # ========== CLOUDFLARE TUNNEL ==========
+      - name: Start Cloudflare Tunnel
+        id: tunnel
+        run: |
+          # Install cloudflared
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+          sudo dpkg -i cloudflared.deb
+
+          # Start tunnel for OpenClaw gateway
+          cloudflared tunnel --url http://localhost:${{ env.OPENCLAW_PORT }} --no-autoupdate > /tmp/cloudflared.log 2>&1 &
+          TUNNEL_PID=$!
+          echo "TUNNEL_PID=$TUNNEL_PID" >> "$GITHUB_OUTPUT"
+
+          # Wait for tunnel URL
+          echo "Waiting for Cloudflare Tunnel URL..."
+          for i in $(seq 1 30); do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Failed to get Cloudflare Tunnel URL"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_OUTPUT"
+          echo "OpenClaw gateway tunnel: $TUNNEL_URL"
+
+      # ========== START OPENCLAW ==========
+      - name: Start OpenClaw gateway
+        run: |
+          export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCLAW_STATE_DIR="$HOME/.openclaw"
+          export OPENCLAW_WORKSPACE="$HOME/.openclaw/workspace"
+          export PLAYWRIGHT_BROWSERS_PATH="$HOME/.playwright-browsers"
+
+          # Stealth: use new headless mode (harder to detect than legacy headless)
+          export PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW=1
+
+          # Start OpenClaw gateway in background
+          nohup openclaw gateway > /tmp/openclaw.log 2>&1 &
+          OPENCLAW_PID=$!
+          echo "$OPENCLAW_PID" > /tmp/openclaw.pid
+
+          # Wait and verify it started
+          sleep 10
+          if kill -0 "$OPENCLAW_PID" 2>/dev/null; then
+            echo "OpenClaw gateway started (PID: $OPENCLAW_PID)"
+            echo "--- startup log ---"
+            cat /tmp/openclaw.log
+            echo "--- end startup log ---"
+          else
+            echo "ERROR: OpenClaw gateway failed to start"
+            cat /tmp/openclaw.log
+            exit 1
+          fi
+
+      - name: Start OpenClaw managed browser
+        run: |
+          export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export PLAYWRIGHT_BROWSERS_PATH="$HOME/.playwright-browsers"
+
+          echo "Starting OpenClaw managed browser (headless, no-sandbox)..."
+
+          # Start the openclaw browser profile
+          openclaw browser --browser-profile openclaw start 2>&1 || true
+          sleep 5
+
+          # Check browser status
+          BROWSER_STATUS=$(openclaw browser --browser-profile openclaw status 2>&1 || echo "unknown")
+          echo "Browser status: $BROWSER_STATUS"
+
+          # Verify CDP is reachable on the configured port
+          if curl -sf http://127.0.0.1:18800/json/version > /dev/null 2>&1; then
+            echo "Browser CDP endpoint is reachable on port 18800"
+
+            # Apply stealth: set realistic user-agent via browser control API
+            GATEWAY_PORT=${{ env.OPENCLAW_PORT }}
+            UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            curl -sf -X POST "http://127.0.0.1:$GATEWAY_PORT/browser/set/headers?profile=openclaw" \
+              -H "Authorization: Bearer openclaw" \
+              -H "Content-Type: application/json" \
+              -d "{\"headers\":{\"User-Agent\":\"$UA\"}}" 2>/dev/null && echo "Stealth: User-Agent set" || echo "WARNING: Could not set User-Agent (non-critical)"
+
+            # Apply stealth: set realistic locale and timezone
+            openclaw browser --browser-profile openclaw set locale en-US 2>/dev/null || true
+            openclaw browser --browser-profile openclaw set timezone America/New_York 2>/dev/null || true
+            echo "Stealth: locale=en-US, timezone=America/New_York"
+          else
+            echo "WARNING: Browser CDP endpoint not reachable yet (gateway may auto-start it on first use)"
+          fi
+
+      - name: Display Connection Info
+        run: |
+          TUNNEL_URL="${{ steps.tunnel.outputs.TUNNEL_URL }}"
+          SESSION_ID="${{ steps.session.outputs.SESSION_ID }}"
+          CHAIN_COUNT="${{ steps.session.outputs.CHAIN_COUNT }}"
+
+          echo ""
+          echo "=============================================="
+          echo "       OPENCLAW SESSION READY"
+          echo "=============================================="
+          echo ""
+          echo "Session ID:    $SESSION_ID"
+          echo "Chain Count:   $CHAIN_COUNT"
+          echo ""
+          echo "OpenClaw Gateway:"
+          echo "  URL:       $TUNNEL_URL"
+          echo "  Local:     http://localhost:${{ env.OPENCLAW_PORT }}"
+          echo ""
+          echo "Browser (openclaw-managed):"
+          echo "  Profile:   openclaw"
+          echo "  CDP Port:  18800"
+          echo "  Headless:  true"
+          echo "  Sandbox:   disabled (CI environment)"
+          echo ""
+          echo "Config:      ~/.openclaw/openclaw.json"
+          echo "Workspace:   ~/.openclaw/workspace"
+          echo "Log:         /tmp/openclaw.log"
+          echo ""
+          echo "Cache version: ${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
+          echo "Upgrade openclaw: Cancel this workflow from GitHub Actions UI"
+          echo ""
+          echo "Session will auto-chain at ~${{ env.CHAIN_TRIGGER_MINUTES }} minutes"
+          echo "=============================================="
+
+      # ========== KEEPALIVE ==========
+      - name: Keep session alive
+        id: keepalive
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          JOB_START=${{ steps.session.outputs.JOB_START }}
+          CHAIN_MINUTES=${{ env.CHAIN_TRIGGER_MINUTES }}
+          HARD_LIMIT_MINUTES=350
+          SAVE_INTERVAL=${{ env.SAVE_INTERVAL_MINUTES }}
+          REPO="${{ github.repository }}"
+          SESSION_ID="${{ steps.session.outputs.SESSION_ID }}"
+          CHAIN_COUNT=${{ steps.session.outputs.CHAIN_COUNT }}
+          OPENCLAW_CACHE_VERSION="${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
+          OPENCLAW_DIR="$HOME/.openclaw"
+
+          CHAIN_TIME=$((JOB_START + CHAIN_MINUTES * 60))
+          HARD_LIMIT=$((JOB_START + HARD_LIMIT_MINUTES * 60))
+          LAST_SAVE=$(date +%s)
+          CHAIN_TRIGGERED=false
+          FAIL_COUNT=0
+          BROWSER_FAIL_COUNT=0
+          LOOP_COUNT=0
+
+          NOW=$(date +%s)
+          SETUP_ELAPSED=$(( (NOW - JOB_START) / 60 ))
+          REMAINING=$(( (CHAIN_TIME - NOW) / 60 ))
+
+          echo "Keep alive started"
+          echo "  Job started:      $(date -d @$JOB_START '+%H:%M:%S')"
+          echo "  Setup took:       ${SETUP_ELAPSED} min"
+          echo "  Chain trigger at: $(date -d @$CHAIN_TIME '+%H:%M:%S') (${CHAIN_MINUTES} min from job start)"
+          echo "  Hard limit at:    $(date -d @$HARD_LIMIT '+%H:%M:%S') (${HARD_LIMIT_MINUTES} min from job start)"
+          echo "  Remaining:        ${REMAINING} min"
+          echo "  Save interval:    every ${SAVE_INTERVAL} min"
+
+          # Helper: save secrets
+          save_secrets() {
+            CONFIG_FILE="$OPENCLAW_DIR/openclaw.json"
+            AUTH_FILE="$OPENCLAW_DIR/agents/main/agent/auth-profiles.json"
+            if [ -f "$CONFIG_FILE" ]; then
+              gh secret set OPENCLAW_CONFIG --repo "$REPO" < "$CONFIG_FILE" 2>/dev/null || true
+            fi
+            if [ -f "$AUTH_FILE" ]; then
+              gh secret set OPENCLAW_AUTH_PROFILES --repo "$REPO" < "$AUTH_FILE" 2>/dev/null || true
+            fi
+            echo "  [SAVE] Secrets saved at $(date '+%H:%M:%S')"
+          }
+
+          # Helper: trigger chain
+          trigger_chain() {
+            NEXT_CHAIN=$((CHAIN_COUNT + 1))
+            echo "  [CHAIN] Triggering next session (chain: $NEXT_CHAIN, cache: $OPENCLAW_CACHE_VERSION)..."
+
+            BODY=$(jq -n \
+              --arg event_type "chain-openclaw" \
+              --arg session_id "$SESSION_ID" \
+              --argjson chain_count "$NEXT_CHAIN" \
+              --arg cache_version "$OPENCLAW_CACHE_VERSION" \
+              '{event_type: $event_type, client_payload: {session_id: $session_id, chain_count: $chain_count, openclaw_cache_version: $cache_version}}')
+
+            for i in 1 2 3; do
+              echo "$BODY" | gh api "repos/$REPO/dispatches" --method POST --input - && {
+                echo "  [CHAIN] Next session triggered on attempt $i"
+                return 0
+              }
+              echo "  [CHAIN] WARNING: attempt $i failed"
+              [ "$i" -lt 3 ] && sleep $((i * 10))
+            done
+            echo "  [CHAIN] ERROR: All 3 attempts failed!"
+            return 1
+          }
+
+          # Main keepalive loop
+          while [ "$(date +%s)" -lt "$HARD_LIMIT" ]; do
+            LOOP_COUNT=$((LOOP_COUNT + 1))
+            NOW=$(date +%s)
+            ELAPSED=$(( (NOW - JOB_START) / 60 ))
+
+            if [ "$CHAIN_TRIGGERED" = "false" ]; then
+              LEFT=$(( (CHAIN_TIME - NOW) / 60 ))
+              echo "Session alive at $(date '+%H:%M:%S') | ${ELAPSED}min elapsed | ${LEFT}min until chain"
+            else
+              LEFT=$(( (HARD_LIMIT - NOW) / 60 ))
+              echo "Session alive at $(date '+%H:%M:%S') | ${ELAPSED}min elapsed | ${LEFT}min until hard limit (chained)"
+            fi
+
+            # Tail OpenClaw log (last 30 lines of new output since last check)
+            if [ -f /tmp/openclaw.log ]; then
+              NEW_LINES=$(wc -l < /tmp/openclaw.log)
+              LAST_LINES=${LAST_LOG_LINES:-0}
+              if [ "$NEW_LINES" -gt "$LAST_LINES" ]; then
+                DIFF=$((NEW_LINES - LAST_LINES))
+                echo "  --- openclaw log (${DIFF} new lines) ---"
+                tail -n "$DIFF" /tmp/openclaw.log | tail -30
+                echo "  --- end log ---"
+              fi
+              LAST_LOG_LINES=$NEW_LINES
+            fi
+
+            # Check if OpenClaw is running, restart if needed
+            if [ -f /tmp/openclaw.pid ]; then
+              OPENCLAW_PID=$(cat /tmp/openclaw.pid)
+              if ! kill -0 "$OPENCLAW_PID" 2>/dev/null; then
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                if [ "$FAIL_COUNT" -le 5 ]; then
+                  echo "  OpenClaw not running (attempt $FAIL_COUNT/5), restarting..."
+                  export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+                  export PATH="$HOME/.npm-global/bin:$PATH"
+                  export OPENCLAW_STATE_DIR="$HOME/.openclaw"
+                  export OPENCLAW_WORKSPACE="$HOME/.openclaw/workspace"
+                  nohup openclaw gateway >> /tmp/openclaw.log 2>&1 &
+                  NEW_PID=$!
+                  echo "$NEW_PID" > /tmp/openclaw.pid
+                  sleep 15
+                  if ! kill -0 "$NEW_PID" 2>/dev/null; then
+                    echo "  OpenClaw crashed within 15s of restart!"
+                    tail -20 /tmp/openclaw.log 2>/dev/null || true
+                  else
+                    echo "  OpenClaw restarted (PID: $NEW_PID)"
+                  fi
+                elif [ "$FAIL_COUNT" -eq 6 ]; then
+                  echo "  OpenClaw failed 5 consecutive restarts - giving up automatic restarts."
+                  echo "  Check log: /tmp/openclaw.log"
+                fi
+              else
+                if [ "$FAIL_COUNT" -gt 0 ]; then
+                  echo "  OpenClaw confirmed running (reset fail counter from $FAIL_COUNT)"
+                fi
+                FAIL_COUNT=0
+              fi
+            fi
+
+            # Check if cloudflared tunnel is still alive
+            if ! pgrep -x cloudflared > /dev/null 2>&1; then
+              echo "  WARNING: Cloudflare Tunnel process died, restarting..."
+              cloudflared tunnel --url http://localhost:${{ env.OPENCLAW_PORT }} --no-autoupdate > /tmp/cloudflared.log 2>&1 &
+              sleep 5
+              NEW_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+              if [ -n "$NEW_URL" ]; then
+                echo "  Tunnel restarted: $NEW_URL"
+              else
+                echo "  WARNING: Tunnel restart may have failed"
+              fi
+            fi
+
+            # Check if OpenClaw managed browser is still reachable
+            if ! curl -sf http://127.0.0.1:18800/json/version > /dev/null 2>&1; then
+              BROWSER_FAIL_COUNT=$((BROWSER_FAIL_COUNT + 1))
+              
+              if [ "$BROWSER_FAIL_COUNT" -le 3 ]; then
+                echo "  WARNING: Browser CDP not reachable (attempt $BROWSER_FAIL_COUNT/3), attempting restart via CLI..."
+                export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+                export PATH="$HOME/.npm-global/bin:$PATH"
+                export PLAYWRIGHT_BROWSERS_PATH="$HOME/.playwright-browsers"
+                openclaw browser --browser-profile openclaw start 2>&1 || true
+                sleep 10
+                if curl -sf http://127.0.0.1:18800/json/version > /dev/null 2>&1; then
+                  echo "  Browser restarted successfully via CLI"
+                  BROWSER_FAIL_COUNT=0
+                else
+                  echo "  WARNING: Browser restart attempt $BROWSER_FAIL_COUNT failed"
+                fi
+              elif [ "$BROWSER_FAIL_COUNT" -eq 4 ]; then
+                echo "  Browser CDP failed 3 restart attempts - giving up automatic restarts."
+                echo "  The gateway will auto-start the browser on the next browser tool call."
+              fi
+            else
+              if [ "$BROWSER_FAIL_COUNT" -gt 0 ]; then
+                echo "  Browser CDP confirmed reachable (reset fail counter from $BROWSER_FAIL_COUNT)"
+              fi
+              BROWSER_FAIL_COUNT=0
+            fi
+
+            # Periodic secret save
+            NOW=$(date +%s)
+            SINCE_SAVE=$(( (NOW - LAST_SAVE) / 60 ))
+            if [ "$SINCE_SAVE" -ge "$SAVE_INTERVAL" ]; then
+              save_secrets
+              LAST_SAVE=$(date +%s)
+            fi
+
+            # Chain trigger
+            if [ "$CHAIN_TRIGGERED" = "false" ] && [ "$(date +%s)" -ge "$CHAIN_TIME" ]; then
+              echo ""
+              echo "=========================================="
+              echo "  CHAIN TIME - saving and triggering"
+              echo "=========================================="
+              save_secrets
+              if trigger_chain; then
+                CHAIN_TRIGGERED=true
+                echo "CHAIN_DONE=true" >> "$GITHUB_OUTPUT"
+                echo "Chain triggered successfully - continuing until hard limit"
+              else
+                echo "WARNING: Chain trigger failed - will retry via fallback step"
+              fi
+              echo "=========================================="
+              echo ""
+            fi
+
+            sleep 60
+          done
+
+          # Final save
+          echo "Hard limit reached - final secret save"
+          save_secrets
+          if [ "$CHAIN_TRIGGERED" = "false" ]; then
+            echo "CHAIN_DONE=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ========== CLEANUP & CHAIN (always runs) ==========
+      - name: Save secrets (fallback)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          OPENCLAW_DIR="$HOME/.openclaw"
+
+          echo "Fallback secret save (in case keepalive was interrupted)..."
+          CONFIG_FILE="$OPENCLAW_DIR/openclaw.json"
+          AUTH_FILE="$OPENCLAW_DIR/agents/main/agent/auth-profiles.json"
+          if [ -f "$CONFIG_FILE" ]; then
+            gh secret set OPENCLAW_CONFIG --repo "$REPO" < "$CONFIG_FILE" 2>/dev/null || true
+          fi
+          if [ -f "$AUTH_FILE" ]; then
+            gh secret set OPENCLAW_AUTH_PROFILES --repo "$REPO" < "$AUTH_FILE" 2>/dev/null || true
+          fi
+          echo "Secrets saved"
+        continue-on-error: true
+
+      - name: Clean workspace before upload
+        if: always()
+        run: |
+          WORKSPACE="$HOME/.openclaw/workspace"
+
+          if [ ! -d "$WORKSPACE" ]; then
+            echo "No workspace to clean"
+            exit 0
+          fi
+
+          echo "Cleaning transient/large files from workspace before upload..."
+
+          # Remove stray openclaw.json copy (contains secrets — must NOT be in artifact)
+          rm -f "$WORKSPACE/openclaw.json"
+
+          # Remove patch experiment leftovers
+          find "$WORKSPACE" -type f \( -name "*.bak" -o -name "*.patched" \) -delete 2>/dev/null || true
+
+          # Remove debug scripts the agent may have created
+          find "$WORKSPACE" -type f -name "fix-*.mjs" -delete 2>/dev/null || true
+
+          # Remove known transient directories
+          find "$WORKSPACE" -type d \( -name "node_modules" -o -name "__pycache__" -o -name ".venv" -o -name "venv" -o -name ".cache" -o -name "cache" -o -name "tmp" -o -name "temp" -o -name "downloads" \) -exec rm -rf {} + 2>/dev/null || true
+
+          # Remove large/binary files
+          find "$WORKSPACE" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.avi" -o -name "*.mov" -o -name "*.webm" -o -name "*.mp3" -o -name "*.wav" -o -name "*.flac" -o -name "*.zip" -o -name "*.tar" -o -name "*.gz" -o -name "*.7z" -o -name "*.rar" -o -name "*.iso" -o -name "*.img" -o -name "*.exe" -o -name "*.msi" -o -name "*.bin" -o -name "*.dat" -o -name "*.psd" -o -name "*.raw" \) -delete 2>/dev/null || true
+
+          # Remove files larger than 10MB
+          find "$WORKSPACE" -type f -size +10M -delete 2>/dev/null || true
+
+          # Remove lock/pid files
+          find "$WORKSPACE" -type f \( -name "*.lock" -o -name "*.pid" \) -delete 2>/dev/null || true
+
+          # Remove empty directories
+          find "$WORKSPACE" -type d -empty -delete 2>/dev/null || true
+
+          # ---- Enforce 400MB hard budget (artifact limit is 500MB) ----
+          MAX_MB=400
+          CURRENT_KB=$(du -sk "$WORKSPACE" 2>/dev/null | cut -f1)
+          CURRENT_MB=$((CURRENT_KB / 1024))
+          echo "Workspace size after cleanup: ${CURRENT_MB}MB (budget: ${MAX_MB}MB)"
+
+          if [ "$CURRENT_MB" -gt "$MAX_MB" ]; then
+            echo "WARNING: Workspace exceeds ${MAX_MB}MB budget, pruning largest files..."
+
+            # Delete largest files first until under budget
+            while [ "$CURRENT_MB" -gt "$MAX_MB" ]; do
+              LARGEST=$(find "$WORKSPACE" -type f -printf '%s %p\n' 2>/dev/null | sort -rn | head -1)
+              if [ -z "$LARGEST" ]; then
+                echo "No more files to prune!"
+                break
+              fi
+              LARGEST_PATH=$(echo "$LARGEST" | cut -d' ' -f2-)
+              LARGEST_SIZE=$(echo "$LARGEST" | cut -d' ' -f1)
+              LARGEST_MB=$((LARGEST_SIZE / 1048576))
+              echo "  Pruning (${LARGEST_MB}MB): $LARGEST_PATH"
+              rm -f "$LARGEST_PATH"
+              CURRENT_KB=$(du -sk "$WORKSPACE" 2>/dev/null | cut -f1)
+              CURRENT_MB=$((CURRENT_KB / 1024))
+            done
+
+            echo "Workspace after pruning: ${CURRENT_MB}MB"
+
+            # Clean up empty dirs left by pruning
+            find "$WORKSPACE" -type d -empty -delete 2>/dev/null || true
+          fi
+
+          # Summary
+          FILE_COUNT=$(find "$WORKSPACE" -type f 2>/dev/null | wc -l)
+          SIZE=$(du -sh "$WORKSPACE" 2>/dev/null | cut -f1)
+          echo "Workspace ready for upload: $FILE_COUNT files, $SIZE"
+
+      - name: Upload workspace artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-workspace
+          path: ~/.openclaw/workspace
+          retention-days: 90
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: Trigger next session (fallback)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          # Skip if keepalive already triggered the chain
+          CHAIN_DONE="${{ steps.keepalive.outputs.CHAIN_DONE }}"
+          if [ "$CHAIN_DONE" = "true" ]; then
+            echo "Chain already triggered by keepalive loop - skipping fallback"
+            exit 0
+          fi
+
+          echo "Fallback chain trigger (keepalive did not complete chain)..."
+
+          SESSION_ID="${{ steps.session.outputs.SESSION_ID }}"
+          NEXT_CHAIN=$(( ${{ steps.session.outputs.CHAIN_COUNT }} + 1 ))
+          OPENCLAW_CACHE_VERSION="${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
+          REPO="${{ github.repository }}"
+
+          # If workflow was cancelled, toggle version to force openclaw upgrade
+          KEEPALIVE_OUTCOME="${{ steps.keepalive.outcome }}"
+          if [ "$KEEPALIVE_OUTCOME" = "cancelled" ]; then
+            if [ "$OPENCLAW_CACHE_VERSION" = "v1" ]; then
+              NEW_VERSION="v2"
+            else
+              NEW_VERSION="v1"
+            fi
+            echo "=========================================="
+            echo "CANCEL DETECTED - UPGRADING OPENCLAW"
+            echo "  Previous cache version: $OPENCLAW_CACHE_VERSION"
+            echo "  New cache version:      $NEW_VERSION"
+            echo "=========================================="
+            OPENCLAW_CACHE_VERSION="$NEW_VERSION"
+          fi
+
+          echo "Triggering next session (chain count: $NEXT_CHAIN, openclaw cache: $OPENCLAW_CACHE_VERSION)..."
+
+          BODY=$(jq -n \
+            --arg event_type "chain-openclaw" \
+            --arg session_id "$SESSION_ID" \
+            --argjson chain_count "$NEXT_CHAIN" \
+            --arg cache_version "$OPENCLAW_CACHE_VERSION" \
+            '{event_type: $event_type, client_payload: {session_id: $session_id, chain_count: $chain_count, openclaw_cache_version: $cache_version}}')
+
+          for i in 1 2 3; do
+            echo "$BODY" | gh api "repos/$REPO/dispatches" --method POST --input - && {
+              echo "Next session triggered on attempt $i"
+              exit 0
+            }
+            echo "WARNING: attempt $i failed"
+            [ "$i" -lt 3 ] && sleep $((i * 15))
+          done
+          echo "ERROR: All 3 attempts to trigger next session failed!"
+
+      # ========== CACHE SAVE ==========
+      - name: Save npm global packages cache
+        if: ${{ always() && steps.cache-npm-global.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.npm-global
+          key: npm-global-openclaw-${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}-${{ runner.os }}
+        continue-on-error: true
+
+      - name: Save Playwright browsers cache
+        if: ${{ always() && steps.cache-playwright.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.playwright-browsers
+          key: playwright-browsers-v1-${{ runner.os }}
+        continue-on-error: true

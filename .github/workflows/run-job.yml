@@ -1,0 +1,50 @@
+name: Run theninerd Job
+
+on:
+  create:
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'branch' && startsWith(github.ref_name, 'job/')
+    permissions:
+      contents: write
+      packages: read
+
+    steps:
+      - name: Login to GHCR
+        if: startsWith(vars.IMAGE_URL, 'ghcr.io/')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build SECRETS and run agent
+        env:
+          IMAGE_URL: ${{ vars.IMAGE_URL }}
+          MODEL: ${{ vars.MODEL }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: |
+          # Build SECRETS JSON from flat secrets and base64-encode it
+          SECRETS=$(echo -n "{\"GH_TOKEN\":\"${GH_PAT}\",\"NVIDIA_API_KEY\":\"${NVIDIA_API_KEY}\"}" | base64 -w 0)
+          
+          if [ -n "$IMAGE_URL" ]; then
+            IMAGE="${IMAGE_URL}:latest"
+          else
+            IMAGE="stephengpope/thepopebot:latest"
+          fi
+          echo "Using image: $IMAGE"
+          chmod +x entrypoint.sh
+          docker run --rm \
+            -v "${{ github.workspace }}/entrypoint.sh:/entrypoint.sh" \
+            -e REPO_URL="${{ github.server_url }}/${{ github.repository }}.git" \
+            -e BRANCH="${{ github.ref_name }}" \
+            -e SECRETS="${SECRETS}" \
+            -e LLM_SECRETS='${{ secrets.LLM_SECRETS }}' \
+            -e MODEL="${MODEL}" \
+            "$IMAGE"
